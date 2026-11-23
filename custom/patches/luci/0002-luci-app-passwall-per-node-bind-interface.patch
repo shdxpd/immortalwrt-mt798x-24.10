@@ -1,8 +1,8 @@
 diff --git a/applications/luci-app-passwall/luasrc/model/cbi/passwall/client/type/sing-box.lua b/applications/luci-app-passwall/luasrc/model/cbi/passwall/client/type/sing-box.lua
-index a1f90b5..241e4f8 100644
+index e9af412..0c49379 100644
 --- a/applications/luci-app-passwall/luasrc/model/cbi/passwall/client/type/sing-box.lua
 +++ b/applications/luci-app-passwall/luasrc/model/cbi/passwall/client/type/sing-box.lua
-@@ -885,6 +885,20 @@ o2:depends({ [_n("chain_proxy")] = "2" })
+@@ -883,6 +883,20 @@ o2:depends({ [_n("chain_proxy")] = "2" })
  o2.template = appname .. "/cbi/nodes_listvalue"
  o2.group = {}
  
@@ -24,7 +24,7 @@ index a1f90b5..241e4f8 100644
  	if v.type == "sing-box" and v.id ~= arg[1] and (not v.chain_proxy or v.chain_proxy == "") then
  		o1:value(v.id, v.remark)
 diff --git a/applications/luci-app-passwall/luasrc/passwall/util_sing-box.lua b/applications/luci-app-passwall/luasrc/passwall/util_sing-box.lua
-index 4452a4e..765380c 100644
+index 80dabbd..4ae7db3 100644
 --- a/applications/luci-app-passwall/luasrc/passwall/util_sing-box.lua
 +++ b/applications/luci-app-passwall/luasrc/passwall/util_sing-box.lua
 @@ -72,6 +72,15 @@ local function get_new_port()
@@ -54,7 +54,7 @@ index 4452a4e..765380c 100644
  		if version_ge_1_12_0 then
  			--https://sing-box.sagernet.org/migration/#migrate-outbound-domain-strategy-option-to-domain-resolver
  			result.domain_strategy = nil
-@@ -1122,6 +1135,7 @@ function gen_config(var)
+@@ -1121,6 +1134,7 @@ function gen_config(var)
  				if shadowtls_outbound then
  					last_insert_outbound = shadowtls_outbound
  					outbound.detour = outbound.tag .. "_shadowtls"
@@ -62,7 +62,7 @@ index 4452a4e..765380c 100644
  					outbound.server = nil
  					outbound.server_port = nil
  				end
-@@ -1138,6 +1152,7 @@ function gen_config(var)
+@@ -1137,6 +1151,7 @@ function gen_config(var)
  							preproxy_outbound.tag = preproxy_node[".name"] .. ":" .. preproxy_node.remarks
  							outbound.tag = preproxy_outbound.tag .. " -> " .. outbound.tag
  							outbound.detour = preproxy_outbound.tag

@@ -24,7 +24,7 @@
 
 `custom/patches/luci/`（打在 `package/luci`）
 - `0001` luci-app-passwall 25.12.16 加 Snell 客户端（sing-box ≥ 1.14）。参照上游 Openwrt-Passwall 的 1fb747a2 精简移植，只保留自己用到的部分：
-  - 节点表单：psk、版本 4/6、连接复用、传输协议、v4 混淆（none/http/tls + 混淆域名）、v6 模式。userkey 复用「密码」字段，可以不填
+  - 节点表单：psk、版本 4/6、连接复用、传输协议、v4 混淆（none/http/tls + 混淆域名）、v6 模式。只用 psk，不提供 sing-box 的 userkey（Surge/官方 snell-server 都用不到）
   - sing-box snell 出站生成。需要 underlying 时，用节点页的「链式代理 → 前置代理节点」，生成的是 `detour`
   - 「添加节点」和订阅支持 `snell://psk@host:port?psk=&version=&reuse=1&obfs=&obfs-host=&mode=#名称`。version=5 会自动改成 4（sing-box 客户端不支持 v5，v5 服务端兼容 v4）
   - 不包含服务端、分享链接导出/二维码、clash 订阅转换

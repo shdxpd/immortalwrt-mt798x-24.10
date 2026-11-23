@@ -1,5 +1,5 @@
 diff --git a/applications/luci-app-passwall/luasrc/model/cbi/passwall/client/type/sing-box.lua b/applications/luci-app-passwall/luasrc/model/cbi/passwall/client/type/sing-box.lua
-index 8a52eb6..a1f90b5 100644
+index 8a52eb6..e9af412 100644
 --- a/applications/luci-app-passwall/luasrc/model/cbi/passwall/client/type/sing-box.lua
 +++ b/applications/luci-app-passwall/luasrc/model/cbi/passwall/client/type/sing-box.lua
 @@ -10,6 +10,7 @@ end
@@ -20,14 +20,12 @@ index 8a52eb6..a1f90b5 100644
  o:value("_urltest", translate("URLTest"))
  o:value("_shunt", translate("Shunt"))
  o:value("_iface", translate("Custom Interface"))
-@@ -314,6 +318,46 @@ o:depends({ [_n("protocol")] = "tuic" })
+@@ -314,6 +318,44 @@ o:depends({ [_n("protocol")] = "tuic" })
  o:depends({ [_n("protocol")] = "anytls" })
  o:depends({ [_n("protocol")] = "ssh" })
  
 +if version_ge_1_14_0 then
-+	-- snell（userkey 复用 password，可留空）
-+	s.fields[_n("password")]:depends({ [_n("protocol")] = "snell" })
-+
++	-- snell：只用 psk，不提供 userkey
 +	o = s:option(Value, _n("snell_psk"), translate("Pre shared key"))
 +	o.password = true
 +	o.rmempty = false
@@ -68,10 +66,10 @@ index 8a52eb6..a1f90b5 100644
  for a, t in ipairs(security_list) do o:value(t) end
  o:depends({ [_n("protocol")] = "vmess" })
 diff --git a/applications/luci-app-passwall/luasrc/passwall/util_sing-box.lua b/applications/luci-app-passwall/luasrc/passwall/util_sing-box.lua
-index 09c97cd..4452a4e 100644
+index 09c97cd..80dabbd 100644
 --- a/applications/luci-app-passwall/luasrc/passwall/util_sing-box.lua
 +++ b/applications/luci-app-passwall/luasrc/passwall/util_sing-box.lua
-@@ -505,6 +505,21 @@ function gen_outbound(flag, node, tag, proxy_table)
+@@ -505,6 +505,20 @@ function gen_outbound(flag, node, tag, proxy_table)
  			}
  		end
  
@@ -81,7 +79,6 @@ index 09c97cd..4452a4e 100644
 +			protocol_table = {
 +				version = ver,
 +				psk = node.snell_psk,
-+				userkey = (node.password and node.password ~= "") and node.password or nil,
 +				reuse = node.snell_reuse == "1" and true or nil,
 +				network = (node.snell_network and node.snell_network ~= "") and node.snell_network or nil,
 +				obfs_mode = obfs,
@@ -111,10 +108,10 @@ index c04c6d1..0fcb3e5 100644
 +msgid "Version"
 +msgstr "版本"
 diff --git a/applications/luci-app-passwall/root/usr/share/passwall/subscribe.lua b/applications/luci-app-passwall/root/usr/share/passwall/subscribe.lua
-index 1b2bdf3..c2fda27 100755
+index 1b2bdf3..8a0922a 100755
 --- a/applications/luci-app-passwall/root/usr/share/passwall/subscribe.lua
 +++ b/applications/luci-app-passwall/root/usr/share/passwall/subscribe.lua
-@@ -1515,6 +1515,62 @@ local function processData(szType, content, add_mode, group)
+@@ -1515,6 +1515,61 @@ local function processData(szType, content, add_mode, group)
  				return nil
  			end
  		end
@@ -163,7 +160,6 @@ index 1b2bdf3..c2fda27 100755
 +			result.address = host_port
 +		end
 +		result.snell_psk = params.psk or result.snell_psk
-+		result.password = params.userkey
 +		result.snell_version = params.version or "4"
 +		-- sing-box 客户端不支持 v5，v5 服务端兼容 v4 客户端
 +		if result.snell_version == "5" then result.snell_version = "4" end
