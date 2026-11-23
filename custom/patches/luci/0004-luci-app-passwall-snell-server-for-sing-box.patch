@@ -1,5 +1,5 @@
 diff --git a/applications/luci-app-passwall/luasrc/model/cbi/passwall/server/type/sing-box.lua b/applications/luci-app-passwall/luasrc/model/cbi/passwall/server/type/sing-box.lua
-index b54e23c..bd0fcca 100644
+index b54e23c..0a338a3 100644
 --- a/applications/luci-app-passwall/luasrc/model/cbi/passwall/server/type/sing-box.lua
 +++ b/applications/luci-app-passwall/luasrc/model/cbi/passwall/server/type/sing-box.lua
 @@ -55,6 +55,7 @@ end
@@ -14,16 +14,16 @@ index b54e23c..bd0fcca 100644
  	o:depends({ [_n("protocol")] = "hysteria2"})
  end
  
-+-- snell 服务端：sing-box 入站只支持 v5（兼容 v4/v5 客户端）和 v6
++-- snell 服务端：sing-box 入站只支持 v6（默认）和 v5（兼容 v4/v5 客户端）
 +o = s:option(Value, _n("snell_psk"), translate("Pre shared key"))
 +o.password = true
 +o.rmempty = false
 +o:depends({ [_n("protocol")] = "snell" })
 +
 +o = s:option(ListValue, _n("snell_version"), translate("Version"))
-+o:value("5", "v5 (v4/v5)")
 +o:value("6", "v6")
-+o.default = "5"
++o:value("5", "v5 (v4/v5)")
++o.default = "6"
 +o:depends({ [_n("protocol")] = "snell" })
 +
 +o = s:option(ListValue, _n("snell_obfs_mode"), translate("Camouflage Type"))
@@ -42,7 +42,7 @@ index b54e23c..bd0fcca 100644
  o:value("tcp", "TCP")
  o:value("udp", "UDP")
 diff --git a/applications/luci-app-passwall/luasrc/passwall/util_sing-box.lua b/applications/luci-app-passwall/luasrc/passwall/util_sing-box.lua
-index ce68e2b..ce1608b 100644
+index ce68e2b..72f846c 100644
 --- a/applications/luci-app-passwall/luasrc/passwall/util_sing-box.lua
 +++ b/applications/luci-app-passwall/luasrc/passwall/util_sing-box.lua
 @@ -858,6 +858,16 @@ function gen_config_server(node)
@@ -50,7 +50,7 @@ index ce68e2b..ce1608b 100644
  	end
  
 +	if node.protocol == "snell" then
-+		local ver = tonumber(node.snell_version) or 5
++		local ver = tonumber(node.snell_version) or 6
 +		protocol_table = {
 +			version = ver,
 +			psk = node.snell_psk,
