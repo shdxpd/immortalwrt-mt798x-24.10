@@ -34,7 +34,7 @@
 
 ## diffconfig 里的主要选择
 
-- 插件：luci-app-passwall（只带 sing-box，不带 Xray/Haproxy/SS-Rust）、luci-app-rtp2httpd + rtp2httpd、wireguard-tools、luci-theme-argon
+- 插件：luci-app-passwall（只带 sing-box，不带 Xray/Haproxy/SS-Rust）、luci-app-pbr + pbr（nft 策略路由，多 WAN 按目的地/设备/域名分流，默认标记段 0xff0000，不和 passwall 的 0x1 冲突）、luci-app-rtp2httpd + rtp2httpd、wireguard-tools、luci-theme-argon
 - 硬件加速：mtkhnat / WED / WARP、safexcel
 - preinit IP 192.168.10.1
 
