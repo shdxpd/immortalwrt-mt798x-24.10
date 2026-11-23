@@ -1,0 +1,86 @@
+diff --git a/applications/luci-app-passwall/luasrc/model/cbi/passwall/client/type/sing-box.lua b/applications/luci-app-passwall/luasrc/model/cbi/passwall/client/type/sing-box.lua
+index a1f90b5..241e4f8 100644
+--- a/applications/luci-app-passwall/luasrc/model/cbi/passwall/client/type/sing-box.lua
++++ b/applications/luci-app-passwall/luasrc/model/cbi/passwall/client/type/sing-box.lua
+@@ -885,6 +885,20 @@ o2:depends({ [_n("chain_proxy")] = "2" })
+ o2.template = appname .. "/cbi/nodes_listvalue"
+ o2.group = {}
+ 
++o = s:option(ListValue, _n("bind_iface"), translate("Bind Interface"), translate("Connect to this node only via the selected WAN. Ignored when a preproxy node is set."))
++o:value("", translate("Auto"))
++api.uci:foreach("network", "interface", function(e)
++	local n, proto = e[".name"], e.proto
++	if n ~= "loopback" and n ~= "lan" and (proto == "pppoe" or proto == "dhcp" or proto == "static") then
++		o:value(n, n .. " (" .. (proto == "pppoe" and ("pppoe-" .. n) or (e.device or n)) .. ")")
++	end
++end)
++for i, v in ipairs(s.fields[_n("protocol")].keylist) do
++	if not v:find("_") then
++		o:depends({ [_n("protocol")] = v })
++	end
++end
++
+ for k, v in pairs(nodes_table) do
+ 	if v.type == "sing-box" and v.id ~= arg[1] and (not v.chain_proxy or v.chain_proxy == "") then
+ 		o1:value(v.id, v.remark)
+diff --git a/applications/luci-app-passwall/luasrc/passwall/util_sing-box.lua b/applications/luci-app-passwall/luasrc/passwall/util_sing-box.lua
+index 4452a4e..765380c 100644
+--- a/applications/luci-app-passwall/luasrc/passwall/util_sing-box.lua
++++ b/applications/luci-app-passwall/luasrc/passwall/util_sing-box.lua
+@@ -72,6 +72,15 @@ local function get_new_port()
+ 	return new_port
+ end
+ 
++local function iface_l3_device(ifname)
++	local dev = sys.exec(string.format("ubus call network.interface.%s status 2>/dev/null | jsonfilter -e '@.l3_device'", ifname)):gsub("%s+", "")
++	if dev == "" then
++		local proto = uci:get("network", ifname, "proto")
++		dev = (proto == "pppoe") and ("pppoe-" .. ifname) or (uci:get("network", ifname, "device") or ifname)
++	end
++	return dev
++end
++
+ function gen_outbound(flag, node, tag, proxy_table)
+ 	local result = nil
+ 	if node then
+@@ -135,6 +144,10 @@ function gen_outbound(flag, node, tag, proxy_table)
+ 			detour = node.detour,
+ 		}
+ 
++		if node.bind_iface and node.bind_iface ~= "" and not node.detour then
++			result.bind_interface = iface_l3_device(node.bind_iface)
++		end
++
+ 		if version_ge_1_12_0 then
+ 			--https://sing-box.sagernet.org/migration/#migrate-outbound-domain-strategy-option-to-domain-resolver
+ 			result.domain_strategy = nil
+@@ -1122,6 +1135,7 @@ function gen_config(var)
+ 				if shadowtls_outbound then
+ 					last_insert_outbound = shadowtls_outbound
+ 					outbound.detour = outbound.tag .. "_shadowtls"
++					outbound.bind_interface = nil
+ 					outbound.server = nil
+ 					outbound.server_port = nil
+ 				end
+@@ -1138,6 +1152,7 @@ function gen_config(var)
+ 							preproxy_outbound.tag = preproxy_node[".name"] .. ":" .. preproxy_node.remarks
+ 							outbound.tag = preproxy_outbound.tag .. " -> " .. outbound.tag
+ 							outbound.detour = preproxy_outbound.tag
++							outbound.bind_interface = nil
+ 							last_insert_outbound = preproxy_outbound
+ 							default_outTag = outbound.tag
+ 						end
+diff --git a/applications/luci-app-passwall/po/zh_Hans/passwall.po b/applications/luci-app-passwall/po/zh_Hans/passwall.po
+index 0fcb3e5..9c38b52 100644
+--- a/applications/luci-app-passwall/po/zh_Hans/passwall.po
++++ b/applications/luci-app-passwall/po/zh_Hans/passwall.po
+@@ -2031,3 +2031,9 @@ msgstr "混淆域名"
+ 
+ msgid "Version"
+ msgstr "版本"
++
++msgid "Bind Interface"
++msgstr "绑定接口"
++
++msgid "Connect to this node only via the selected WAN. Ignored when a preproxy node is set."
++msgstr "只通过选定的 WAN 连接此节点。设置了前置代理节点时不生效。"

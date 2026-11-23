@@ -28,6 +28,7 @@
   - sing-box snell 出站生成。需要 underlying 时，用节点页的「链式代理 → 前置代理节点」，生成的是 `detour`
   - 「添加节点」和订阅支持 `snell://psk@host:port?psk=&version=&reuse=1&obfs=&obfs-host=&mode=#名称`。version=5 会自动改成 4（sing-box 客户端不支持 v5，v5 服务端兼容 v4）
   - 不包含服务端、分享链接导出/二维码、clash 订阅转换
+- `0002` sing-box 节点加「绑定接口」：下拉框里是 network 里的 pppoe/dhcp/static 接口（不含 lan），生成配置时转成 L3 设备名（如 `pppoe-wan2`），写进出站的 `bind_interface`。默认「自动」，按路由表走。设了前置代理节点时不生效（出站改用 `detour`，由前置节点自己决定走哪个口）
 
 ## diffconfig 里的主要选择
 
