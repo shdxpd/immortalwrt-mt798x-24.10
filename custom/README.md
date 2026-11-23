@@ -29,6 +29,7 @@
   - 「添加节点」和订阅支持 `snell://psk@host:port?psk=&version=&reuse=1&obfs=&obfs-host=&mode=#名称`。version=5 会自动改成 4（sing-box 客户端不支持 v5，v5 服务端兼容 v4）
   - 不包含服务端、分享链接导出/二维码、clash 订阅转换
 - `0002` sing-box 节点加「绑定接口」：下拉框里是 network 里的 pppoe/dhcp/static 接口（不含 lan），生成配置时转成 L3 设备名（如 `pppoe-wan2`），写进出站的 `bind_interface`。默认「自动」，按路由表走。设了前置代理节点时不生效（出站改用 `detour`，由前置节点自己决定走哪个口）
+- `0003` 分流规则支持 sing-box 规则集（参照上游 Openwrt-Passwall 的 `rule-set:` 写法，精简移植）：域名/IP 列表里一行写 `rule-set:remote:<URL>` 或 `rule-set:local:<路径>`，支持 `.srs`（binary）和 `.json`（source）。远程规则集经分流的默认出口下载（sing-box 1.14 用 `http_clients`，旧版用 `download_detour`），缓存在 `/usr/share/passwall/singbox_rule_set.db`，重启不用重新下载。全部用在线规则集时不需要 geoview 和 geosite/geoip.dat。DNS 辅助脚本（chinadns-ng/dnsmasq/smartdns）会跳过这些行，所以它们只影响 sing-box 的路由，不参与 DNS 分流
 
 ## diffconfig 里的主要选择
 

@@ -1,0 +1,193 @@
+diff --git a/applications/luci-app-passwall/luasrc/model/cbi/passwall/client/shunt_rules.lua b/applications/luci-app-passwall/luasrc/model/cbi/passwall/client/shunt_rules.lua
+index db14415..086f6ac 100644
+--- a/applications/luci-app-passwall/luasrc/model/cbi/passwall/client/shunt_rules.lua
++++ b/applications/luci-app-passwall/luasrc/model/cbi/passwall/client/shunt_rules.lua
+@@ -161,6 +161,8 @@ domain_list.validate = function(self, value)
+ 			tmp_host = host:gsub("full:", "")
+ 		elseif host:find("geosite:") and host:find("geosite:") == 1 then
+ 			flag = 0
++		elseif host:find("rule-set:", 1, true) == 1 and not host:find("%s") then
++			flag = 0
+ 		elseif host:find("ext:") and host:find("ext:") == 1 then
+ 			flag = 0
+ 		elseif host:find("#") and host:find("#") == 1 then
+@@ -179,6 +181,8 @@ domain_list.description = "<br /><ul><li>" .. translate("Plaintext: If this stri
+ .. "</li><li>" .. translate("Subdomain (recommended): Begining with 'domain:' and the rest is a domain. When the targeting domain is exactly the value, or is a subdomain of the value, this rule takes effect. Example: rule 'domain:v2ray.com' matches 'www.v2ray.com', 'v2ray.com', but not 'xv2ray.com'.")
+ .. "</li><li>" .. translate("Full domain: Begining with 'full:' and the rest is a domain. When the targeting domain is exactly the value, the rule takes effect. Example: rule 'domain:v2ray.com' matches 'v2ray.com', but not 'www.v2ray.com'.")
+ .. "</li><li>" .. translate("Pre-defined domain list: Begining with 'geosite:' and the rest is a name, such as geosite:google or geosite:cn.")
++.. "</li><li>" .. translate("Sing-Box rule-set (.srs or .json): begin with 'rule-set:remote:' or 'rule-set:local:'. Remote rule-sets are downloaded via the default node and cached.") .. "<br />"
++.. "rule-set:remote:https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-cn.srs"
+ .. "</li><li>" .. translate("Annotation: Begining with #")
+ .. "</li></ul>"
+ ip_list = s:option(TextValue, "ip_list", "IP")
+@@ -190,6 +194,7 @@ ip_list.validate = function(self, value)
+ 	string.gsub(value, "[^\r\n]+", function(w) table.insert(ipmasks, w) end)
+ 	for index, ipmask in ipairs(ipmasks) do
+ 		if ipmask:find("geoip:") and ipmask:find("geoip:") == 1 and not ipmask:find("%s") then
++		elseif ipmask:find("rule-set:", 1, true) == 1 and not ipmask:find("%s") then
+ 		elseif ipmask:find("ext:") and ipmask:find("ext:") == 1 and not ipmask:find("%s") then
+ 		elseif ipmask:find("#") and ipmask:find("#") == 1 then
+ 		else
+@@ -203,6 +208,8 @@ end
+ ip_list.description = "<br /><ul><li>" .. translate("IP: such as '127.0.0.1'.")
+ .. "</li><li>" .. translate("CIDR: such as '127.0.0.0/8'.")
+ .. "</li><li>" .. translate("GeoIP: such as 'geoip:cn'. It begins with geoip: (lower case) and followed by two letter of country code.")
++.. "</li><li>" .. translate("Sing-Box rule-set (.srs or .json): begin with 'rule-set:remote:' or 'rule-set:local:'. Remote rule-sets are downloaded via the default node and cached.") .. "<br />"
++.. "rule-set:remote:https://raw.githubusercontent.com/SagerNet/sing-geoip/rule-set/geoip-cn.srs"
+ .. "</li><li>" .. translate("Annotation: Begining with #")
+ .. "</li></ul>"
+ 
+diff --git a/applications/luci-app-passwall/luasrc/passwall/util_sing-box.lua b/applications/luci-app-passwall/luasrc/passwall/util_sing-box.lua
+index 4ae7db3..ce68e2b 100644
+--- a/applications/luci-app-passwall/luasrc/passwall/util_sing-box.lua
++++ b/applications/luci-app-passwall/luasrc/passwall/util_sing-box.lua
+@@ -10,9 +10,35 @@ local split = api.split
+ local local_version = api.get_app_version("sing-box"):match("[^v]+")
+ local version_ge_1_11_0 = api.compare_versions(local_version, ">=", "1.11.0")
+ local version_ge_1_12_0 = api.compare_versions(local_version, ">=", "1.12.0")
++local version_ge_1_14_0 = api.compare_versions(local_version, ">=", "1.14.0")
+ 
+ local geosite_all_tag = {}
+ local geoip_all_tag = {}
++local custom_rule_set = {}  -- rule-set:remote:URL / rule-set:local:PATH
++
++-- w 去掉 "rule-set:" 前缀后的部分，如 remote:https://x/geosite-cn.srs、local:/path/a.json
++local function parse_rule_set(w)
++	local _type, src = w:match("^(%a+):(.+)$")
++	if _type ~= "remote" and _type ~= "local" then return nil end
++	local filename = src:match("([^/]+)$") or ""
++	local name, suffix = filename:match("^(.-)%.(%w+)$")
++	local format = (suffix == "srs" and "binary") or (suffix == "json" and "source") or nil
++	if not format or not name or name == "" then return nil end
++	local tag = "rs_" .. name
++	local base, i = tag, 1
++	while custom_rule_set[tag] and (custom_rule_set[tag].url or custom_rule_set[tag].path) ~= src do
++		i = i + 1
++		tag = base .. "_" .. i
++	end
++	custom_rule_set[tag] = {
++		type = _type,
++		tag = tag,
++		format = format,
++		path = _type == "local" and src or nil,
++		url = _type == "remote" and src or nil,
++	}
++	return tag
++end
+ local srss_path = "/tmp/etc/" .. appname .."_tmp/srss/"
+ 
+ local function convert_geofile()
+@@ -1422,6 +1448,12 @@ function gen_config(var)
+ 								geosite_all_tag[_geosite] = true
+ 								table.insert(rule_set_tag, "geosite-" .. _geosite)
+ 								table.insert(domain_table.rule_set, "geosite-" .. _geosite)
++							elseif w:find("rule-set:", 1, true) == 1 then
++								local tag = parse_rule_set(w:sub(1 + #"rule-set:"))
++								if tag then
++									table.insert(rule_set_tag, tag)
++									table.insert(domain_table.rule_set, tag)
++								end
+ 							elseif w:find("regexp:") == 1 then
+ 								table.insert(domain_table.domain_regex, w:sub(1 + #"regexp:"))
+ 							elseif w:find("full:") == 1 then
+@@ -1455,6 +1487,9 @@ function gen_config(var)
+ 									geoip_all_tag[_geoip] = true
+ 									table.insert(rule_set_tag, "geoip-" .. _geoip)
+ 								end
++							elseif w:find("rule-set:", 1, true) == 1 then
++								local tag = parse_rule_set(w:sub(1 + #"rule-set:"))
++								if tag then table.insert(rule_set_tag, tag) end
+ 							else
+ 								table.insert(ip_cidr, w)
+ 							end
+@@ -1499,6 +1534,32 @@ function gen_config(var)
+ 					table.insert(rule_set, _rule_set)
+ 				end
+ 			end
++			local has_remote = false
++			for _, v in pairs(custom_rule_set) do
++				if v.type == "remote" then
++					has_remote = true
++					if version_ge_1_14_0 then
++						v.http_client = "rule_set_http_client"
++					else
++						v.download_detour = (COMMON.default_outbound_tag ~= "block") and COMMON.default_outbound_tag or "direct"
++					end
++				end
++				table.insert(rule_set, v)
++			end
++			if has_remote then
++				-- 远程规则集经默认出口下载，缓存到 cache.db，重启时不必重新下载
++				if version_ge_1_14_0 then
++					COMMON.rule_set_http_client = {
++						tag = "rule_set_http_client",
++						detour = (COMMON.default_outbound_tag ~= "block") and COMMON.default_outbound_tag or "direct"
++					}
++				end
++				experimental = experimental or {}
++				experimental.cache_file = experimental.cache_file or {
++					enabled = true,
++					path = "/usr/share/" .. appname .. "/singbox_rule_set.db"
++				}
++			end
+ 			route.rule_set = #rule_set >0 and rule_set or nil
+ 
+ 		elseif node.protocol == "_urltest" then
+@@ -1863,6 +1924,7 @@ function gen_config(var)
+ 			route = route,
+ 			--实验性
+ 			experimental = experimental,
++			http_clients = COMMON.rule_set_http_client and { COMMON.rule_set_http_client } or nil,
+ 		}
+ 
+ 		local direct_outbound = {
+diff --git a/applications/luci-app-passwall/po/zh_Hans/passwall.po b/applications/luci-app-passwall/po/zh_Hans/passwall.po
+index 9c38b52..1b14293 100644
+--- a/applications/luci-app-passwall/po/zh_Hans/passwall.po
++++ b/applications/luci-app-passwall/po/zh_Hans/passwall.po
+@@ -2037,3 +2037,6 @@ msgstr "绑定接口"
+ 
+ msgid "Connect to this node only via the selected WAN. Ignored when a preproxy node is set."
+ msgstr "只通过选定的 WAN 连接此节点。设置了前置代理节点时不生效。"
++
++msgid "Sing-Box rule-set (.srs or .json): begin with 'rule-set:remote:' or 'rule-set:local:'. Remote rule-sets are downloaded via the default node and cached."
++msgstr "Sing-Box 规则集（.srs 或 .json）：以 'rule-set:remote:' 或 'rule-set:local:' 开头，仅 Sing-Box 分流有效。远程规则集经默认节点下载并缓存。"
+diff --git a/applications/luci-app-passwall/root/usr/share/passwall/helper_chinadns_add.lua b/applications/luci-app-passwall/root/usr/share/passwall/helper_chinadns_add.lua
+index ea12980..7b55f2b 100644
+--- a/applications/luci-app-passwall/root/usr/share/passwall/helper_chinadns_add.lua
++++ b/applications/luci-app-passwall/root/usr/share/passwall/helper_chinadns_add.lua
+@@ -366,7 +366,7 @@ if uci:get(appname, TCP_NODE, "protocol") == "_shunt" then
+ 
+ 			local domain_list = s.domain_list or ""
+ 			for line in string.gmatch(domain_list, "[^\r\n]+") do
+-				if line ~= "" and not line:find("#") and not line:find("regexp:") and not line:find("ext:") then
++				if line ~= "" and not line:find("#") and not line:find("regexp:") and not line:find("ext:") and not line:find("rule-set:", 1, true) then
+ 					if line:find("geosite:") then
+ 						line = string.match(line, ":([^:]+)$")
+ 						if _node_id == "_direct" then
+diff --git a/applications/luci-app-passwall/root/usr/share/passwall/helper_dnsmasq.lua b/applications/luci-app-passwall/root/usr/share/passwall/helper_dnsmasq.lua
+index 2ce13de..bc4a8cb 100644
+--- a/applications/luci-app-passwall/root/usr/share/passwall/helper_dnsmasq.lua
++++ b/applications/luci-app-passwall/root/usr/share/passwall/helper_dnsmasq.lua
+@@ -587,7 +587,7 @@ function add_rule(var)
+ 
+ 					local domain_list = s.domain_list or ""
+ 					for line in string.gmatch(domain_list, "[^\r\n]+") do
+-						if line ~= "" and not line:find("#") and not line:find("regexp:") and not line:find("geosite:") and not line:find("ext:") then
++						if line ~= "" and not line:find("#") and not line:find("regexp:") and not line:find("geosite:") and not line:find("ext:") and not line:find("rule-set:", 1, true) then
+ 							if line:find("domain:") or line:find("full:") then
+ 								line = string.match(line, ":([^:]+)$")
+ 							end
+diff --git a/applications/luci-app-passwall/root/usr/share/passwall/helper_smartdns_add.lua b/applications/luci-app-passwall/root/usr/share/passwall/helper_smartdns_add.lua
+index 9bb9ecb..6137243 100644
+--- a/applications/luci-app-passwall/root/usr/share/passwall/helper_smartdns_add.lua
++++ b/applications/luci-app-passwall/root/usr/share/passwall/helper_smartdns_add.lua
+@@ -521,7 +521,7 @@ if uci:get(appname, TCP_NODE, "protocol") == "_shunt" then
+ 
+ 			local domain_list = s.domain_list or ""
+ 			for line in string.gmatch(domain_list, "[^\r\n]+") do
+-				if line ~= "" and not line:find("#") and not line:find("regexp:") and not line:find("ext:") then
++				if line ~= "" and not line:find("#") and not line:find("regexp:") and not line:find("ext:") and not line:find("rule-set:", 1, true) then
+ 					if line:find("geosite:") then
+ 						line = string.match(line, ":([^:]+)$")
+ 						if _node_id == "_direct" then
