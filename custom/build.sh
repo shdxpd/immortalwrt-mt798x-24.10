@@ -2,7 +2,7 @@
 # 在干净目录里复现 TL-7DR7299 自编固件：
 #   上游 padavanonly/immortalwrt-mt798x-6.6 @ BASE_REV
 #   + custom/patches/immortalwrt/*.patch
-#   + immortalwrt/luci @ LUCI_REV（放在 package/luci）
+#   + immortalwrt/luci @ LUCI_REV（放在 package/luci）+ custom/patches/luci/*.patch
 #   + immortalwrt/packages @ PACKAGES_REV（feed）+ custom/patches/packages/*.patch
 #   + custom/diffconfig
 #
@@ -43,6 +43,9 @@ done
 
 echo "==> luci $LUCI_REV -> package/luci"
 fetch_rev "$LUCI_URL" "$LUCI_REV" package/luci
+for p in "$HERE"/patches/luci/*.patch; do
+  echo "    apply $(basename "$p")"; git -C package/luci apply "$p"
+done
 
 echo "==> feeds: packages $PACKAGES_REV, luci $LUCI_FEED_REV"
 # luci feed 只更新不安装：package/mtk 下的 luci 应用要 include feeds/luci/luci.mk
