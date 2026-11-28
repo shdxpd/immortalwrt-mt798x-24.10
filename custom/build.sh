@@ -4,6 +4,7 @@
 #   + custom/patches/immortalwrt/*.patch
 #   + immortalwrt/luci @ LUCI_REV（放在 package/luci）+ custom/patches/luci/*.patch
 #   + immortalwrt/packages @ PACKAGES_REV（feed）+ custom/patches/packages/*.patch
+#   + custom/packages/*（自有包，如 luci-app-devmon，拷到 package/custom）
 #   + custom/diffconfig
 #
 # 用法: custom/build.sh [工作目录]   （默认 ./immortalwrt）
@@ -46,6 +47,10 @@ fetch_rev "$LUCI_URL" "$LUCI_REV" package/luci
 for p in "$HERE"/patches/luci/*.patch; do
   echo "    apply $(basename "$p")"; git -C package/luci apply "$p"
 done
+
+echo "==> 自有包 custom/packages -> package/custom"
+mkdir -p package/custom
+cp -a "$HERE"/packages/. package/custom/
 
 echo "==> feeds: packages $PACKAGES_REV, luci $LUCI_FEED_REV"
 # luci feed 只更新不安装：package/mtk 下的 luci 应用要 include feeds/luci/luci.mk

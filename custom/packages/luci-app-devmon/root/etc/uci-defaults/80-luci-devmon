@@ -1,0 +1,53 @@
+#!/bin/sh
+# luci-app-devmon first-boot / install defaults
+
+touch /etc/config/devmon
+
+# nlbwmon: daily periods, keep 31 days, persistent db (survives reboot/sysupgrade)
+if [ "$(uci -q get devmon.qos.nlbw_init)" != "1" ] && uci -q get nlbwmon.@nlbwmon[0] >/dev/null; then
+	uci -q batch <<-EOT
+		set nlbwmon.@nlbwmon[0].database_interval='$(date +%Y-%m)-01/1'
+		set nlbwmon.@nlbwmon[0].database_generations='31'
+		set nlbwmon.@nlbwmon[0].database_directory='/etc/nlbwmon'
+		set nlbwmon.@nlbwmon[0].commit_interval='1h'
+		set nlbwmon.@nlbwmon[0].refresh_interval='30s'
+		commit nlbwmon
+	EOT
+	mkdir -p /etc/nlbwmon
+	grep -qx '/etc/nlbwmon/' /etc/sysupgrade.conf 2>/dev/null || echo '/etc/nlbwmon/' >> /etc/sysupgrade.conf
+	/etc/init.d/nlbwmon enabled && /etc/init.d/nlbwmon restart >/dev/null 2>&1
+	uci -q get devmon.qos >/dev/null || uci set devmon.qos=qos
+	uci set devmon.qos.nlbw_init='1'
+fi
+
+# rate-limit settings: create defaults, migrate once from eqos-mtk if present
+if ! uci -q get devmon.qos.enabled >/dev/null; then
+	uci -q get devmon.qos >/dev/null || uci set devmon.qos=qos
+	uci set devmon.qos.enabled='1'
+	uci set devmon.qos.download="$(uci -q get eqos.config.download || echo 2500)"
+	uci set devmon.qos.upload="$(uci -q get eqos.config.upload || echo 2500)"
+	if [ -f /etc/config/eqos ]; then
+		i=0
+		while uci -q get eqos.@device[$i] >/dev/null; do
+			s=$(uci add devmon limit)
+			for o in ip mac download upload enabled comment; do
+				v=$(uci -q get eqos.@device[$i].$o) && uci set devmon.$s.$o="$v"
+			done
+			i=$((i + 1))
+		done
+	fi
+fi
+uci commit devmon
+
+# retire eqos-mtk's engine if it is still installed (its iface hotplug restarts it otherwise)
+if [ -x /etc/init.d/eqos ]; then
+	uci -q set eqos.config.enabled='0' && uci commit eqos
+	/etc/init.d/eqos stop >/dev/null 2>&1
+	/etc/init.d/eqos disable >/dev/null 2>&1
+	rm -f /usr/share/luci/menu.d/luci-app-eqos.json
+fi
+
+/etc/init.d/devmon enable
+[ -d /sys/kernel/debug/hnat ] && /usr/sbin/devmon-qos sync
+rm -f /tmp/luci-indexcache* /tmp/luci-modulecache/* 2>/dev/null
+exit 0

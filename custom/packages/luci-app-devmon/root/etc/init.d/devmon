@@ -1,0 +1,25 @@
+#!/bin/sh /etc/rc.common
+# devmon per-device rate limit (HNAT QDMA). turboacc (START=90) loads the HNAT module first.
+
+START=95
+STOP=10
+USE_PROCD=1
+
+start_service() {
+	/usr/sbin/devmon-qos sync
+}
+
+stop_service() {
+	/usr/sbin/devmon-qos stop
+}
+
+reload_service() {
+	/usr/sbin/devmon-qos sync
+}
+
+service_triggers() {
+	procd_add_reload_trigger "devmon"
+	# turboacc restart reloads the HNAT module and wipes QDMA settings
+	procd_add_config_trigger "config.change" "turboacc" /usr/sbin/devmon-qos check
+	procd_add_config_trigger "config.change" "firewall" /usr/sbin/devmon-qos check
+}

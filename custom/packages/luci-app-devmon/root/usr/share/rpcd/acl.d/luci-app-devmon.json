@@ -1,0 +1,12 @@
+{
+	"luci-app-devmon": {
+		"description": "Grant access to device monitor / per-device limits",
+		"read": {
+			"ubus": { "devmon": [ "stats", "usage" ] }
+		},
+		"write": {
+			"ubus": { "devmon": [ "set_limit", "set_limits", "rename" ] },
+			"uci": [ "devmon" ]
+		}
+	}
+}

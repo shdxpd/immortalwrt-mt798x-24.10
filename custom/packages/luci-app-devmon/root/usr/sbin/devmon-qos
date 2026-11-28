@@ -1,0 +1,233 @@
+#!/usr/bin/ucode -S
+// devmon-qos: per-device rate limit on MediaTek HNAT QDMA queues (replaces eqos-mtk)
+//
+//   queue q (1..31)   : upload of one device   -> scheduler 2 (total upload)
+//   queue q+32        : download of that device -> scheduler 3 (total download)
+//   nft table inet devmon marks the device's IPv4 packets with DSCP q / q+32;
+//   the PPE copies DSCP into the bound entry's queue id, so the limit holds for
+//   hardware-offloaded flows too. Unlimited traffic is reset to DSCP 0 (queue 0/32).
+//
+// usage: devmon-qos sync | stop | check | status
+'use strict';
+
+import { readfile, writefile, unlink, stat, access } from 'fs';
+import { cursor } from 'uci';
+
+const D = '/sys/kernel/debug/hnat/';
+const NQ = 31;
+const LAN = 'br-lan';
+const STATE = '/var/run/devmon-qos.json';
+const NFT = '/var/run/devmon-qos.nft';
+
+function hw(f, v) { return writefile(D + f, v + '\n') != null; }
+
+// QDMA stores a rate as mantissa(<=127) * 10^exp kbit (the driver truncates to
+// the smallest exp that fits), and the shaper's real speed depends on the
+// mantissa. Measured TCP goodput / configured rate on TL-7DR7299 (iperf3, MSS
+// 1448, both directions agree within 0.5%; real runs land ~0.8% under it):
+const GAIN = [
+	[15, 0.9437], [18, 0.9466], [20, 0.9502], [25, 0.9542], [30, 0.9568], [35, 0.9588],
+	[40, 0.9634], [45, 0.9641], [50, 0.9699], [60, 0.9764], [70, 0.9811], [80, 0.9896],
+	[90, 0.9961], [100, 1.004], [110, 1.0116], [120, 1.0191], [127, 1.0237]
+];
+function gain(m) {
+	if (m <= GAIN[0][0]) return 0.933 + 0.000714 * m;
+	for (let i = 1; i < length(GAIN); i++) {
+		let a = GAIN[i - 1], b = GAIN[i];
+		if (m <= b[0]) return a[1] + (b[1] - a[1]) * (m - a[0]) / (b[0] - a[0]);
+	}
+	return GAIN[length(GAIN) - 1][1];
+}
+// canonical (driver) mantissa of a representable value
+function mant(x) { while (x > 127) x /= 10; return x; }
+// pick the representable rate whose real throughput is closest to `kbit`
+let HWC = {};
+function hwrate(kbit, raw) {
+	if (raw || kbit <= 0) return kbit;
+	if (HWC[kbit]) return HWC[kbit];
+	let best = kbit, err = null;
+	for (let e = 0, p = 1; e <= 6; e++, p *= 10) {
+		for (let m = e ? 13 : 1; m <= 127; m++) {
+			let x = m * p, d = x * gain(mant(x)) * 0.992 - kbit;
+			if (d < 0) d = -d * 1.2;   // prefer slightly above target over below
+			if (err == null || d < err) { err = d; best = x; }
+		}
+	}
+	return (HWC[kbit] = best);
+}
+function valid_ip4(i) { return i != null && match(i, /^[0-9]{1,3}(\.[0-9]{1,3}){3}$/) != null; }
+function hnat_id() { let s = stat(D); return s ? sprintf('%d.%d', s.inode, s.ctime) : null; }
+function rd_state() { try { return json(readfile(STATE) ?? '{}'); } catch (e) { return {}; } }
+function wr_state(s) { writefile(STATE, sprintf('%J', s)); }
+
+function hnat_unbind(ip) {
+	let txt = readfile(D + 'hnat_entry');
+	if (!txt) return 0;
+	let ppe = 0, cmds = [];
+	for (let l in split(txt, '\n')) {
+		let m = match(l, /^PPE_ID = ([0-9]+)/);
+		if (m) { ppe = +m[1]; continue; }
+		m = match(l, /\(([0-9]+)\):/);
+		if (m && (index(l, ' ' + ip + ':') >= 0 || index(l, '>' + ip + ':') >= 0))
+			push(cmds, sprintf('%d %s', ppe * 2 + 3, m[1]));
+	}
+	for (let c in cmds) writefile(D + 'hnat_entry', c);
+	return length(cmds);
+}
+
+function load() {
+	let c = cursor();
+	c.load('devmon');
+	let q = {
+		enabled: (c.get('devmon', 'qos', 'enabled') ?? '1') == '1',
+		down: +(c.get('devmon', 'qos', 'download') ?? 2500) || 2500,
+		up: +(c.get('devmon', 'qos', 'upload') ?? 2500) || 2500,
+		raw: c.get('devmon', 'qos', 'calibrate') == '0'
+	};
+	let L = [];
+	c.foreach('devmon', 'limit', (s) => {
+		let qid = +(s.qid ?? 0);
+		push(L, {
+			sid: s['.name'], ip: s.ip, mac: s.mac,
+			down: int(+(s.download ?? 0)), up: int(+(s.upload ?? 0)),
+			en: (s.enabled ?? '1') == '1', qid: (qid >= 1 && qid <= NQ) ? qid : 0
+		});
+	});
+	for (let l in L) if (!valid_ip4(l.ip) || (!l.up && !l.down)) l.en = false;
+	return { c, q, L };
+}
+
+// sticky queue ids: an enabled limit keeps its qid; new ones take a never-used
+// qid first, then reclaim one from a disabled limit (unbinding that device's
+// offloaded flows so they cannot keep running in the reassigned queue).
+function assign(c, L) {
+	let owner = {}, changed = false;
+	for (let l in filter(L, (x) => x.en)) {
+		if (l.qid && !owner[l.qid]) owner[l.qid] = l;
+		else if (l.qid) l.qid = 0;
+	}
+	for (let l in filter(L, (x) => !x.en)) {
+		if (l.qid && !owner[l.qid]) owner[l.qid] = l;
+		else if (l.qid) { l.qid = 0; c.delete('devmon', l.sid, 'qid'); changed = true; }
+	}
+	for (let l in L) {
+		if (!l.en || l.qid) continue;
+		let q = 0;
+		for (let i = 1; i <= NQ; i++) if (!owner[i]) { q = i; break; }
+		if (!q) {
+			for (let i = 1; i <= NQ; i++) if (!owner[i].en) { q = i; break; }
+			if (q) {
+				let old = owner[q];
+				old.qid = 0;
+				c.delete('devmon', old.sid, 'qid');
+				if (valid_ip4(old.ip)) hnat_unbind(old.ip);
+			}
+		}
+		if (!q) { l.en = false; l.over = true; continue; }
+		owner[q] = l; l.qid = q;
+		c.set('devmon', l.sid, 'qid', '' + q);
+		changed = true;
+	}
+	if (changed) { c.save('devmon'); c.commit('devmon'); }
+}
+
+function nft_rules(act) {
+	let r = [];
+	for (let l in act) {
+		if (l.up) push(r, sprintf('\t\tip saddr %s ip dscp set %d', l.ip, l.qid));
+		if (l.down) push(r, sprintf('\t\tip daddr %s ip dscp set %d', l.ip, l.qid + 32));
+	}
+	return 'table inet devmon\ndelete table inet devmon\n' +
+		'table inet devmon {\n\tchain qos_fwd {\n' +
+		'\t\ttype filter hook forward priority mangle; policy accept;\n' +
+		sprintf('\t\tiifname "%s" ip dscp set 0\n\t\toifname "%s" ip dscp set 0\n', LAN, LAN) +
+		join('\n', r) + '\n\t}\n}\n';
+}
+
+function hw_off() {
+	for (let i = 0; i < 32; i++) hw('qdma_txq' + i, '0 0 0 0 0 4 4');
+	for (let i = 32; i < 64; i++) hw('qdma_txq' + i, '1 0 0 0 0 4 4');
+	for (let i = 0; i < 4; i++) hw('qdma_sch' + i, '0 wrr 25000000');
+	hw('qos_toggle', 0);
+	hw('hnat_setting', '10 0');
+	let c = cursor();
+	hw('hnat_setting', '11 ' + (+(c.get('turboacc', 'config', 'fastpath_mh_eth_hnat_bind_rate') ?? 30) || 30));
+}
+
+// only touch the hardware if we configured it (or when forced from the CLI)
+function stop(force) {
+	let st = rd_state();
+	system('nft delete table inet devmon >/dev/null 2>&1');
+	if ((force || st.hnat) && access(D + 'qos_toggle')) hw_off();
+	unlink(STATE);
+	return 0;
+}
+
+function sync() {
+	let ld = load(), c = ld.c, q = ld.q, L = ld.L;
+	assign(c, L);
+	let act = q.enabled ? filter(L, (x) => x.en && x.qid) : [];
+	if (!length(act)) { stop(); return 0; }
+	if (!access(D + 'qos_toggle')) { warn('devmon-qos: HNAT debugfs not present\n'); return 1; }
+
+	let st = rd_state(), id = hnat_id();
+	if (st.hnat != id) {
+		// fresh HNAT instance (boot / module reload): global QoS setup once
+		hw('qos_toggle', 1);
+		hw('qdma_sch0', '0 wrr 25000000');
+		hw('qdma_sch1', '0 wrr 25000000');
+		hw('qdma_txq0', '0 0 0 0 0 0 0');
+		hw('qdma_txq32', '1 0 0 0 0 0 0');
+		hw('hnat_setting', '11 5');   // bind after 5 pkt/s so limited flows offload quickly
+		hw('hnat_setting', '10 1');
+		st = {};
+	}
+	hw('qdma_sch2', '1 wrr ' + q.up * 1000);
+	hw('qdma_sch3', '1 wrr ' + q.down * 1000);
+
+	let byq = {};
+	for (let l in act) byq[l.qid] = l;
+	let want = {};
+	for (let i = 1; i <= NQ; i++) {
+		let l = byq[i];
+		want['' + i] = l && l.up ? sprintf('2 0 0 1 %d 4 1', hwrate(l.up, q.raw)) : '0 0 0 0 0 4 4';
+		want['' + (i + 32)] = l && l.down ? sprintf('3 0 0 1 %d 4 1', hwrate(l.down, q.raw)) : '1 0 0 0 0 4 4';
+	}
+	let old = st.txq ?? {};
+	for (let k in want) if (old[k] != want[k]) hw('qdma_txq' + k, want[k]);
+
+	let rules = nft_rules(act);
+	if (st.nft != rules || system('nft list table inet devmon >/dev/null 2>&1') != 0) {
+		writefile(NFT, rules);
+		if (system(sprintf('nft -f %s', NFT)) != 0) { warn('devmon-qos: nft load failed\n'); return 1; }
+	}
+	wr_state({ hnat: id, txq: want, nft: rules,
+		limits: map(act, (l) => ({ ip: l.ip, mac: l.mac, qid: l.qid, up: l.up, down: l.down,
+			hw_up: hwrate(l.up, q.raw), hw_down: hwrate(l.down, q.raw) })) });
+	return 0;
+}
+
+// cheap re-apply after HNAT module reload or a firewall flush
+function check() {
+	let st = rd_state();
+	if (!st.hnat) return 0;
+	if (st.hnat != hnat_id() || system('nft list table inet devmon >/dev/null 2>&1') != 0)
+		return sync();
+	return 0;
+}
+
+function status() {
+	let ld = load(), q = ld.q, L = ld.L;
+	let st = rd_state();
+	printf('%.J\n', { active: !!st.hnat, enabled: q.enabled, total: { down: q.down, up: q.up },
+		limits: st.limits ?? [], configured: length(L), enabled_limits: length(filter(L, (x) => x.en)) });
+	return 0;
+}
+
+let cmd = ARGV[0], rc = 2;
+if (cmd == 'sync') rc = sync();
+else if (cmd == 'stop') rc = stop(ARGV[1] == '-f');
+else if (cmd == 'check') rc = check();
+else if (cmd == 'status') rc = status();
+else warn('usage: devmon-qos sync | stop [-f] | check | status\n');
+exit(rc);

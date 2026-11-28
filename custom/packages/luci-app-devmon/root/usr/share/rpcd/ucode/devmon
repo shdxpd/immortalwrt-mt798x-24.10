@@ -1,0 +1,551 @@
+// luci-app-devmon backend: per-device realtime rate from conntrack (HNAT aware) + devmon-qos limits (HNAT QDMA)
+'use strict';
+
+import { open, popen, readfile, writefile, access } from 'fs';
+import { cursor } from 'uci';
+
+const WIN = 8.0;          // rate window (s); HNAT syncs ct counters every ~4s
+const GAP = 30.0;         // re-seed if no poll for this long
+const STALE = 7.0;        // no counter change for this long => idle (4s HNAT batch + poll jitter)
+const HNAT = '/sys/kernel/debug/hnat/hnat_entry';
+
+let S = {
+	flows: {}, dev: {}, wan: {}, seen: {},
+	last: 0, ifs: null, ifs_t: 0
+};
+
+function now() { let c = clock(true); return c[0] + c[1] / 1e9; }
+
+function cmd_lines(c) {
+	let p = popen(c), out = [];
+	if (!p) return out;
+	for (let l = p.read('line'); length(l); l = p.read('line'))
+		push(out, rtrim(l, '\n'));
+	p.close();
+	return out;
+}
+
+function ip4int(ip) {
+	let p = split(ip, '.');
+	if (length(p) != 4) return null;
+	return ((+p[0] * 256 + +p[1]) * 256 + +p[2]) * 256 + +p[3];
+}
+
+function valid_mac(m) { return m != null && match(m, /^([0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}$/) != null; }
+function valid_ip4(i) { return i != null && match(i, /^[0-9]{1,3}(\.[0-9]{1,3}){3}$/) != null; }
+
+/* router addresses, wan names, lan subnets (refreshed every 30s) */
+function refresh_ifs(t) {
+	if (S.ifs && t - S.ifs_t < 30) return S.ifs;
+	let l3 = {}, self = {}, addr2if = {}, lan = [];
+	let d = cmd_lines('ubus call network.interface dump 2>/dev/null');
+	let j = json(join('\n', d) || '{}');
+	for (let i in j?.interface ?? []) {
+		if (i.l3_device) l3[i.l3_device] = i.interface;
+		if (i.device && !l3[i.device]) l3[i.device] = i.interface;
+	}
+	for (let l in cmd_lines('ip -o addr show 2>/dev/null')) {
+		let m = match(l, /^[0-9]+: ([^ ]+)\s+inet6? ([^\/ ]+)(\/([0-9]+))?/);
+		if (!m) continue;
+		let dev = m[1], a = m[2], pl = +(m[4] ?? 32);
+		self[a] = true;
+		let name = l3[dev] ?? dev;
+		if (name == 'lan' || dev == 'br-lan') {
+			if (index(a, ':') < 0) push(lan, [ip4int(a), pl]);
+		}
+		else if (dev != 'lo')
+			addr2if[a] = name;
+	}
+	S.ifs = { self, addr2if, lan };
+	S.ifs_t = t;
+	return S.ifs;
+}
+
+function in_lan4(ifs, ip) {
+	if (index(ip, ':') >= 0) return false;
+	let n = ip4int(ip);
+	if (n == null) return false;
+	for (let s in ifs.lan) {
+		let div = 2 ** (32 - s[1]);
+		if (int(n / div) == int(s[0] / div)) return true;
+	}
+	return false;
+}
+
+function read_neigh() {
+	let ip2mac = {}, macs = {};
+	for (let l in cmd_lines('ip neigh show dev br-lan 2>/dev/null')) {
+		let m = match(l, /^([^ ]+) lladdr ([0-9a-f:]+)( router)? ([A-Z]+)/);
+		if (!m) continue;
+		let ip = m[1], mac = m[2], st = m[4];
+		if (st == 'FAILED' || st == 'INCOMPLETE') continue;
+		ip2mac[ip] = mac;
+		macs[mac] ??= { v4: [], v6: [], reach: false };
+		push(index(ip, ':') >= 0 ? macs[mac].v6 : macs[mac].v4, ip);
+		if (st == 'REACHABLE' || st == 'DELAY' || st == 'PROBE' || st == 'PERMANENT')
+			macs[mac].reach = true;
+	}
+	return { ip2mac, macs };
+}
+
+function read_leases() {
+	let r = {};
+	let txt = readfile('/tmp/dhcp.leases') ?? '';
+	for (let l in split(txt, '\n')) {
+		let f = split(l, ' ');
+		if (length(f) < 4) continue;
+		r[lc(f[1])] = { ip: f[2], name: (f[3] != '*') ? f[3] : null };
+	}
+	return r;
+}
+
+function read_names(c) {
+	let r = {};
+	c.load('dhcp');
+	c.foreach('dhcp', 'host', (s) => {
+		if (!s.name || !s.mac) return;
+		for (let m in split(type(s.mac) == 'array' ? join(' ', s.mac) : s.mac, ' '))
+			if (valid_mac(m)) r[lc(m)] = s.name;
+	});
+	if (access('/etc/config/devmon')) {
+		c.load('devmon');
+		c.foreach('devmon', 'host', (s) => {
+			if (s.mac && s.name) r[lc(s.mac)] = s.name;
+		});
+	}
+	return r;
+}
+
+function read_limits(c) {
+	let r = [];
+	c.load('devmon');
+	c.foreach('devmon', 'limit', (s) => {
+		push(r, {
+			sid: s['.name'], ip: s.ip, mac: s.mac ? lc(s.mac) : null,
+			down: +(s.download ?? 0), up: +(s.upload ?? 0),
+			enabled: (s.enabled ?? '1') == '1', comment: s.comment, qid: s.qid ? +s.qid : null
+		});
+	});
+	return r;
+}
+
+/* window rate; o.h = [[t, up, down], ...] cumulative */
+/* Rate from points where the counters actually changed. HNAT writes counters
+ * back in ~4s batches, so sampling at fixed times gives a staircase; measuring
+ * between change points removes most of that quantisation error. */
+function sample(o, t, u, d) {
+	o.h ??= [];
+	let n = length(o.h), last = n ? o.h[n - 1] : null;
+	if (!last)
+		push(o.h, [t, u, d]);
+	else if (u != last[1] || d != last[2]) {
+		/* first change after idle: baseline is the previous (unchanged) poll */
+		if (o.lt != null && o.lt > last[0] && o.lt - last[0] > STALE) {
+			o.h = [[o.lt, last[1], last[2]]];
+		}
+		push(o.h, [t, u, d]);
+	}
+	o.lt = t;
+	while (length(o.h) > 2 && o.h[1][0] <= t - WIN) shift(o.h);
+	let a = o.h[0], b = o.h[length(o.h) - 1], dt = b[0] - a[0];
+	if (dt < 0.5 || t - b[0] > STALE) return [0, 0];
+	return [(b[1] - a[1]) * 8 / dt, (b[2] - a[2]) * 8 / dt];
+}
+
+function parse_ct(line) {
+	let tk = split(trim(line), /\s+/);
+	if (length(tk) < 6) return null;
+	let f = { fam: tk[0], proto: tk[2], s: [], d: [], sp: [], dp: [], b: [] };
+	for (let i = 3; i < length(tk); i++) {
+		let e = index(tk[i], '=');
+		if (e < 0) continue;
+		let k = substr(tk[i], 0, e), v = substr(tk[i], e + 1);
+		if (k == 'src') push(f.s, v);
+		else if (k == 'dst') push(f.d, v);
+		else if (k == 'sport' || k == 'type') push(f.sp, v);
+		else if (k == 'dport' || k == 'code') push(f.dp, v);
+		else if (k == 'bytes') push(f.b, +v);
+	}
+	if (length(f.s) < 2 || length(f.b) < 2) return null;
+	return f;
+}
+
+function poll_ct(t, want_mac) {
+	let ifs = refresh_ifs(t);
+	let nb = read_neigh();
+	let seed = (S.last == 0 || t - S.last > GAP);
+	let flows = {}, conns = {}, devwan = {}, flist = [];
+	let total = 0;
+
+	if (seed) {
+		for (let k in S.dev) S.dev[k].h = null;
+		for (let k in S.wan) S.wan[k].h = null;
+	}
+
+	let fd = open('/proc/net/nf_conntrack', 'r');
+	for (let line = fd?.read('line'); length(line); line = fd.read('line')) {
+		total++;
+		let f = parse_ct(line);
+		if (!f) continue;
+		let s0 = f.s[0], d0 = f.d[0], s1 = f.s[1], d1 = f.d[1];
+		let client, up, down, remote, rport;
+		let lan0 = !ifs.self[s0] && (nb.ip2mac[s0] || in_lan4(ifs, s0));
+		let lan1 = !ifs.self[s1] && (nb.ip2mac[s1] || in_lan4(ifs, s1));
+		if (lan0) { client = s0; up = f.b[0]; down = f.b[1]; remote = d0; rport = f.dp[0]; }
+		else if (lan1) { client = s1; up = f.b[1]; down = f.b[0]; remote = s0; rport = f.dp[0]; }
+		else continue;
+		if (ifs.self[d0] && ifs.self[s1]) continue;   /* to the router itself */
+
+		let wan;
+		if (lan0 && ifs.addr2if[d1]) wan = ifs.addr2if[d1];
+		else if (lan1 && ifs.addr2if[d0]) wan = ifs.addr2if[d0];
+		else if (ifs.self[s1]) wan = '代理';
+		else if (lan0 && (nb.ip2mac[d0] || in_lan4(ifs, d0))) wan = '内网';
+		else if (f.fam == 'ipv6') wan = 'IPv6';
+		else wan = '其他';
+
+		let key = join(' ', [f.proto, s0, f.sp[0], d0, f.dp[0]]);
+		let p = S.flows[key];
+		let du = 0, dd = 0, o;
+		if (p) {
+			du = up >= p.u ? up - p.u : up;      /* counter zeroed (nlbwmon) */
+			dd = down >= p.d ? down - p.d : down;
+			o = p;
+		}
+		else {
+			o = { au: 0, ad: 0, h: null };
+			if (!seed) { du = up; dd = down; o.h = [[S.last, 0, 0]]; }
+		}
+		o.u = up; o.d = down;
+		o.au += du; o.ad += dd;
+		flows[key] = o;
+
+		let mac = nb.ip2mac[client] ?? client;
+		let dv = S.dev[mac] ??= { au: 0, ad: 0, h: null };
+		dv.au += du; dv.ad += dd;
+		let w = S.wan[wan] ??= { au: 0, ad: 0, h: null };
+		w.au += du; w.ad += dd;
+		conns[mac] = (conns[mac] ?? 0) + 1;
+
+		let r = sample(o, t, o.au, o.ad);
+		devwan[mac] ??= {};
+		devwan[mac][wan] ??= [0, 0];
+		devwan[mac][wan][0] += r[0];
+		devwan[mac][wan][1] += r[1];
+
+		if (want_mac && mac == want_mac)
+			push(flist, { proto: f.proto, remote, rport, client, wan,
+				up: r[0], down: r[1], tu: up, td: down });
+	}
+	fd?.close();
+
+	S.flows = flows;
+	S.last = t;
+
+	let devrate = {};
+	for (let k in S.dev) {
+		devrate[k] = sample(S.dev[k], t, S.dev[k].au, S.dev[k].ad);
+		if (!conns[k] && devrate[k][0] == 0 && devrate[k][1] == 0)
+			delete S.dev[k];
+	}
+	let wans = [];
+	for (let k in S.wan) {
+		let r = sample(S.wan[k], t, S.wan[k].au, S.wan[k].ad);
+		push(wans, { name: k, up: r[0], down: r[1] });
+	}
+
+	return { nb, conns, devwan, devrate, wans, flist, total };
+}
+
+// device attachment: bridge fdb port -> wired iface / wifi iface (+ iwinfo assoc signal)
+function read_links(t, c) {
+	if (S.lk_t && t - S.lk_t < 5) return S.lk;
+	let br = 'br-lan', pn = {}, wl = {};
+	for (let l in cmd_lines(sprintf("ls /sys/class/net/%s/brif 2>/dev/null", br))) {
+		let no = +trim(readfile(sprintf('/sys/class/net/%s/brif/%s/port_no', br, l)) ?? '0');
+		pn[no] = l;
+		let info = join(' ', cmd_lines(sprintf("iwinfo %s info 2>/dev/null", l)));
+		let m = match(info, /\(([0-9.]+) GHz\)/);
+		if (m || match(l, /^(ra|rai|wlan|phy)/))
+			wl[l] = { band: m ? (+m[1] > 5.9 ? '6G' : (+m[1] > 4 ? '5G' : '2.4G')) : null,
+				ssid: match(info, /ESSID: "([^"]*)"/)?.[1] };
+	}
+	let lk = S.lk ?? {};
+	for (let l in cmd_lines(sprintf("brctl showmacs %s 2>/dev/null", br))) {
+		let f = split(trim(l), /\s+/);
+		if (length(f) < 3 || f[2] != 'no' || !valid_mac(f[1])) continue;
+		let ifn = pn[+f[0]];
+		if (!ifn) continue;
+		let mac = lc(f[1]), w = wl[ifn];
+		let label = c.get('devmon', 'port_' + replace(ifn, /[^A-Za-z0-9_]/g, '_'), 'label');
+		lk[mac] = w ? { type: 'wifi', iface: ifn, band: w.band, ssid: w.ssid, age: +f[3] }
+			: { type: 'lan', iface: ifn, label, age: +f[3] };
+	}
+	for (let ifn in wl) {
+		let cur = null;
+		for (let l in cmd_lines(sprintf("iwinfo %s assoclist 2>/dev/null", ifn))) {
+			let m = match(l, /^([0-9A-Fa-f:]{17})\s+(-?[0-9]+) dBm/);
+			if (m) {
+				cur = lc(m[1]);
+				lk[cur] = { type: 'wifi', iface: ifn, band: wl[ifn].band, ssid: wl[ifn].ssid, signal: +m[2], age: 0 };
+				continue;
+			}
+			m = cur ? match(l, /^\s+(RX|TX): ([0-9.]+) MBit\/s/) : null;
+			if (m) lk[cur][m[1] == 'RX' ? 'rx_rate' : 'tx_rate'] = +m[2];
+		}
+	}
+	S.lk = lk; S.lk_t = t;
+	return lk;
+}
+
+function stats(req) {
+	let t = now(), wall = time();
+	// re-apply limits if the HNAT module was reloaded or the firewall flushed our table
+	if (t - (S.qc ?? 0) > 10) { S.qc = t; system('/usr/sbin/devmon-qos check >/dev/null 2>&1'); }
+	let want = req.args?.mac ? lc(req.args.mac) : null;
+	let r = poll_ct(t, want);
+	let c = cursor();
+	let leases = read_leases(), names = read_names(c), limits = read_limits(c), links = read_links(t, c);
+
+	let devs = {};
+	let get = (mac) => devs[mac] ??= { mac, v4: [], v6: [], online: false, conns: 0, up: 0, down: 0 };
+
+	for (let mac in r.nb.macs) {
+		let n = r.nb.macs[mac], d = get(mac);
+		d.v4 = n.v4; d.v6 = n.v6;
+		d.online = n.reach || (r.conns[mac] ?? 0) > 0;
+	}
+	for (let mac in leases) {
+		let d = get(mac);
+		if (!length(d.v4)) d.v4 = [leases[mac].ip];
+		d.hostname = leases[mac].name;
+	}
+	for (let k in r.devrate) {
+		let d = get(k);
+		d.up = r.devrate[k][0]; d.down = r.devrate[k][1];
+		if (d.up > 0 || d.down > 0) d.online = true;
+	}
+	for (let k in r.conns) get(k).conns = r.conns[k];
+	for (let k in devs) if (links[k] && links[k].age < 30 && length(devs[k].v4)) devs[k].online = true;
+	for (let l in limits) {
+		let mac = l.mac;
+		if (!mac) {
+			for (let k in devs)
+				if (index(devs[k].v4, l.ip) >= 0) { mac = k; break; }
+		}
+		let d = get(mac ?? l.ip);
+		d.limit = l;
+		if (!length(d.v4) && l.ip) d.v4 = [l.ip];
+	}
+
+	let out = [];
+	for (let k in devs) {
+		let d = devs[k];
+		if (d.online) S.seen[k] ??= wall;
+		else delete S.seen[k];
+		push(out, {
+			mac: valid_mac(k) ? k : null,
+			ip: d.v4[0], ip6: d.v6,
+			name: names[k] ?? d.hostname ?? d.limit?.comment,
+			hostname: d.hostname,
+			online: d.online, since: S.seen[k] ? wall - S.seen[k] : null,
+			up: d.up, down: d.down, conns: d.conns,
+			wan: r.devwan[k] ?? {},
+			limit: d.limit,
+			link: links[k]
+		});
+	}
+
+	let res = {
+		ts: wall, devices: out, wans: r.wans, conntrack: r.total,
+		conntrack_max: +trim(readfile('/proc/sys/net/netfilter/nf_conntrack_max') ?? '0'),
+		eqos_enabled: (c.get('devmon', 'qos', 'enabled') ?? '1') == '1',
+		eqos_down: +(c.get('devmon', 'qos', 'download') ?? 2500),
+		eqos_up: +(c.get('devmon', 'qos', 'upload') ?? 2500)
+	};
+	if (want) {
+		res.flows = slice(sort(r.flist, (a, b) => (b.down + b.up) - (a.down + a.up) || (b.td - a.td)), 0, 1000);
+	}
+	return res;
+}
+
+function ymd(ts) {
+	let t = localtime(ts);
+	return sprintf('%04d-%02d-%02d', t.year, t.mon, t.mday);
+}
+
+function nlbw_day(date) {
+	// current period: query the daemon's live data (-t returns the last on-disk commit)
+	let t = date ? sprintf(' -t %s', date) : '';
+	let txt = join('\n', cmd_lines(sprintf("nlbw -c json -g mac%s 2>/dev/null", t)));
+	let j = length(txt) ? json(txt) : null;
+	let out = {};
+	if (type(j?.data) != 'array') return out;
+	let col = {};
+	for (let i, c in j.columns) col[c] = i;
+	for (let r in j.data) {
+		let mac = lc(r[col.mac] ?? '');
+		if (!valid_mac(mac)) continue;
+		let o = out[mac] ??= { rx: 0, tx: 0 };
+		o.rx += +(r[col.rx_bytes] ?? 0);
+		o.tx += +(r[col.tx_bytes] ?? 0);
+	}
+	return out;
+}
+
+const PERIODS = { today: 1, yesterday: 1, '7d': 1, '30d': 1, month: 1 };
+
+function usage(req) {
+	let p = req.args?.period ?? 'today';
+	if (!PERIODS[p]) p = 'today';
+	let wall = time(), lt = localtime(wall);
+	let today = ymd(wall), from = today, to = today;
+	if (p == 'yesterday') from = to = ymd(wall - 86400);
+	else if (p == '7d') from = ymd(wall - 6 * 86400);
+	else if (p == '30d') from = ymd(wall - 29 * 86400);
+	else if (p == 'month') from = sprintf('%04d-%02d-01', lt.year, lt.mon);
+
+	S.uc ??= {};
+	let devs = {}, rx = 0, tx = 0, days = [];
+	for (let d in cmd_lines('nlbw -c list 2>/dev/null')) {
+		d = trim(d);
+		if (!match(d, /^[0-9]{4}-[0-9]{2}-[0-9]{2}$/) || d < from || d > to) continue;
+		push(days, d);
+		let m = d == today ? nlbw_day(null) : (S.uc[d] ?? nlbw_day(d));
+		if (d != today) S.uc[d] = m;
+		for (let mac in m) {
+			let o = devs[mac] ??= { rx: 0, tx: 0 };
+			o.rx += m[mac].rx; o.tx += m[mac].tx;
+			rx += m[mac].rx; tx += m[mac].tx;
+		}
+	}
+	days = sort(days);
+	return { period: p, from, to, days: length(days), first: days[0], rx, tx, devices: devs };
+}
+
+function hnat_unbind(ip) {
+	let txt = readfile(HNAT);
+	if (!txt) return 0;
+	let ppe = 0, cmds = [];
+	for (let l in split(txt, '\n')) {
+		let m = match(l, /^PPE_ID = ([0-9]+)/);
+		if (m) { ppe = +m[1]; continue; }
+		m = match(l, /\(([0-9]+)\):/);
+		if (m && (index(l, ' ' + ip + ':') >= 0 || index(l, '>' + ip + ':') >= 0))
+			push(cmds, sprintf('%d %s', ppe * 2 + 3, m[1]));
+	}
+	for (let c in cmds) writefile(HNAT, c);
+	return length(cmds);
+}
+
+function truthy(v) { return v === true || v == 1 || v == '1'; }
+
+// apply one limit to many devices: single uci commit + one devmon-qos sync
+function apply_limits(items, up, down, en, reset) {
+	up = int(+(up ?? 0)); down = int(+(down ?? 0));
+	if (up < 0 || down < 0 || up > 10000000 || down > 10000000) return { error: 'bad rate' };
+	if (en && up == 0 && down == 0) en = false;
+	if (type(items) != 'array' || !length(items)) return { error: '没有选择设备' };
+
+	let c = cursor();
+	c.load('devmon');
+	let secs = [];
+	c.foreach('devmon', 'limit', (s) => push(secs, {
+		sid: s['.name'], mac: s.mac ? lc(s.mac) : null, ip: s.ip, en: (s.enabled ?? '1') == '1'
+	}));
+
+	let done = [], failed = [];
+	for (let it in items) {
+		let mac = it?.mac ? lc(it.mac) : null, ip = it?.ip;
+		if (mac && !valid_mac(mac)) { push(failed, { mac, ip, error: 'bad mac' }); continue; }
+		if (!valid_ip4(ip)) { push(failed, { mac, ip, error: '没有 IPv4 地址' }); continue; }
+		let sec = null;
+		for (let x in secs)
+			if ((mac && x.mac == mac) || (!x.mac && x.ip == ip) || (!mac && x.ip == ip)) { sec = x; break; }
+		let old_en = sec ? sec.en : false, old_ip = sec ? sec.ip : null;
+		if (!sec) {
+			if (!en) { push(done, { mac, ip, noop: true }); continue; }
+			sec = { sid: c.add('devmon', 'limit'), mac, ip, en: false };
+			push(secs, sec);
+		}
+		c.set('devmon', sec.sid, 'ip', ip);
+		if (mac) c.set('devmon', sec.sid, 'mac', mac);
+		c.set('devmon', sec.sid, 'download', '' + down);
+		c.set('devmon', sec.sid, 'upload', '' + up);
+		c.set('devmon', sec.sid, 'enabled', en ? '1' : '0');
+		if (it.name) c.set('devmon', sec.sid, 'comment', '' + it.name);
+		sec.en = en; sec.ip = ip;
+		push(done, { mac, ip, sid: sec.sid, old_en, old_ip });
+	}
+	let cnt = 0;
+	for (let x in secs) if (x.en) cnt++;
+	if (en && cnt > 31) {
+		c.revert('devmon');
+		return { error: sprintf('硬件限速最多只能同时限速 31 台设备（这次操作后会有 %d 台）', cnt) };
+	}
+	if (en) {
+		if (!c.get('devmon', 'qos')) c.set('devmon', 'qos', 'qos');
+		c.set('devmon', 'qos', 'enabled', '1');
+		if (!+(c.get('devmon', 'qos', 'download') ?? 0)) c.set('devmon', 'qos', 'download', '2500');
+		if (!+(c.get('devmon', 'qos', 'upload') ?? 0)) c.set('devmon', 'qos', 'upload', '2500');
+	}
+	c.save('devmon');
+	c.commit('devmon');
+	if (system('/usr/sbin/devmon-qos sync >/dev/null 2>&1') != 0) return { error: '限速规则下发失败（devmon-qos sync）' };
+
+	let killed = 0, unbound = 0;
+	for (let d in done) {
+		if (d.noop || !en) continue;
+		let k = 0;
+		if (reset) {
+			system(sprintf("conntrack -D -s %s >/dev/null 2>&1; conntrack -D -r %s >/dev/null 2>&1", d.ip, d.ip));
+			killed++; k = 1;
+		}
+		if (!d.old_en || d.old_ip != d.ip || k) unbound += hnat_unbind(d.ip);
+	}
+	return { ok: true, count: length(done), failed, reset: killed, unbound, sid: done[0]?.sid };
+}
+
+function set_limit(req) {
+	let a = req.args ?? {};
+	let r = apply_limits([{ mac: a.mac, ip: a.ip, name: a.name }], a.up, a.down, truthy(a.enabled), truthy(a.reset));
+	if (r.ok && length(r.failed)) return { error: r.failed[0].error };
+	return r;
+}
+
+function set_limits(req) {
+	let a = req.args ?? {};
+	return apply_limits(a.items, a.up, a.down, truthy(a.enabled), truthy(a.reset));
+}
+
+function rename(req) {
+	let mac = req.args?.mac ? lc(req.args.mac) : null;
+	let name = trim(req.args?.name ?? '');
+	if (!valid_mac(mac)) return { error: 'bad mac' };
+	if (!access('/etc/config/devmon')) writefile('/etc/config/devmon', '');
+	let c = cursor();
+	c.load('devmon');
+	let id = replace(mac, /:/g, '');
+	if (name == '') c.delete('devmon', id);
+	else {
+		c.set('devmon', id, 'host');
+		c.set('devmon', id, 'mac', mac);
+		c.set('devmon', id, 'name', name);
+	}
+	c.save('devmon');
+	c.commit('devmon');
+	return { ok: true };
+}
+
+return {
+	devmon: {
+		stats: { args: { mac: 'mac' }, call: stats },
+		usage: { args: { period: 'period' }, call: usage },
+		set_limit: {
+			args: { mac: 'mac', ip: 'ip', up: 0, down: 0, enabled: true, reset: true, name: 'name' },
+			call: set_limit
+		},
+		set_limits: { args: { items: [], up: 0, down: 0, enabled: true, reset: true }, call: set_limits },
+		rename: { args: { mac: 'mac', name: 'name' }, call: rename }
+	}
+};

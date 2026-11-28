@@ -208,3 +208,11 @@ CONFIG_first_card_name="MT7992"
 CONFIG_PACKAGE_libopenssl-conf=y
 CONFIG_PACKAGE_libopenssl-legacy=y
 CONFIG_PACKAGE_ucode-mod-uloop=y
+# 设备监控 + HNAT QDMA 硬件限速（自有包，取代 luci-app-eqos-mtk / luci-app-nlbwmon）
+CONFIG_PACKAGE_luci-app-devmon=y
+# CONFIG_PACKAGE_luci-app-eqos-mtk is not set
+# CONFIG_PACKAGE_luci-app-nlbwmon is not set
+CONFIG_PACKAGE_wget-ssl=y
+CONFIG_PACKAGE_tc-tiny=y
+# 9929 回家（headscale 子网路由），1.104.7 见 patches/packages/0003
+CONFIG_PACKAGE_tailscale=y
